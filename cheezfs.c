@@ -20,6 +20,13 @@
 
 #include "tree.h"
 
+enum {
+	CHEEZ_INIT,
+	CHEEZ_PREPARE,
+	CHEEZ_BULK,
+	CHEEZ_IGNORE,
+};
+
 struct czfs_inode {
 	int fd;
 	ino_t ino;
@@ -54,11 +61,16 @@ static const struct fuse_opt czfs_opts[] = {
 
 RB_GENERATE(czfs_itree, czfs_inode, link, inode_compare);
 
-struct czfs_dup {
-	ino_t prev_ino;
-	dev_t prev_dev;
-	int prev_fd;
+struct czfs_filep {
+	int fd;
+	int state;
 };
+
+static struct czfs_filep *
+czfs_filep(struct fuse_file_info *fi)
+{
+	return (struct czfs_filep *)(uintptr_t)fi->fh;
+}
 
 static struct czfs_data *
 czfs_data(fuse_req_t req)
@@ -159,7 +171,7 @@ czfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
 	int res;
 	struct stat buf;
-	int fd = fi ? fi->fh : czfs_inode(req, ino)->fd;
+	int fd = fi ? czfs_filep(fi)->fd : czfs_inode(req, ino)->fd;
 
 	res = fstatat(fd, "", &buf, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
 	if (res == -1) {
@@ -181,7 +193,7 @@ czfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int valid,
 
 	if (valid & FUSE_SET_ATTR_MODE) {
 		if (fi) {
-			res = fchmod(fi->fh, attr->st_mode);
+			res = fchmod(czfs_filep(fi)->fd, attr->st_mode);
 		} else {
 			sprintf(procname, "/proc/self/fd/%i", ifd);
 			res = chmod(procname, attr->st_mode);
@@ -203,7 +215,7 @@ czfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int valid,
 	}
 	if (valid & FUSE_SET_ATTR_SIZE) {
 		if (fi) {
-			res = ftruncate(fi->fh, attr->st_size);
+			res = ftruncate(czfs_filep(fi)->fd, attr->st_size);
 		} else {
 			sprintf(procname, "/proc/self/fd/%i", ifd);
 			res = truncate(procname, attr->st_size);
@@ -230,7 +242,7 @@ czfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int valid,
 			tv[1] = attr->st_mtim;
 
 		if (fi)
-			res = futimens(fi->fh, tv);
+			res = futimens(czfs_filep(fi)->fd, tv);
 		else {
 			sprintf(procname, "/proc/self/fd/%i", ifd);
 			res = utimensat(AT_FDCWD, procname, tv, 0);
@@ -412,18 +424,19 @@ static void
 czfs_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode,
 	    struct fuse_file_info *fi)
 {
-	int fd;
+	struct czfs_filep *fh = malloc(sizeof(*fh));
 	struct fuse_entry_param e;
 	int err;
 
-	fd = openat(czfs_inode(req, parent)->fd, name,
-		    (fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
-	if (fd == -1) {
+	fh->fd = openat(czfs_inode(req, parent)->fd, name,
+			(fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
+	if (fh->fd == -1) {
 		fuse_reply_err(req, errno);
 		return;
 	}
+	fh->state = CHEEZ_INIT;
 
-	fi->fh = fd;
+	fi->fh = (uint64_t)fh;
 
 	err = do_lookup(req, parent, name, &e);
 	if (err) {
@@ -437,16 +450,17 @@ czfs_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode,
 static void
 czfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-	int fd;
 	char buf[64];
+	struct czfs_filep *fh = malloc(sizeof(*fh));
 
 	sprintf(buf, "/proc/self/fd/%i", czfs_inode(req, ino)->fd);
-	fd = open(buf, fi->flags & ~O_NOFOLLOW);
-	if (fd == -1) {
+	fh->fd = open(buf, fi->flags & ~O_NOFOLLOW);
+	if (fh->fd == -1) {
 		fuse_reply_err(req, errno);
 		return;
 	}
-	fi->fh = fd;
+	fh->state = CHEEZ_INIT;
+	fi->fh = (uint64_t)fh;
 
 	if (fi->flags & O_DIRECT)
 		fi->direct_io = 1;
@@ -457,7 +471,8 @@ czfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 static void
 czfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-	close(fi->fh);
+	close(czfs_filep(fi)->fd);
+	free((void *)fi->fh);
 	fuse_reply_err(req, 0);
 	return;
 }
@@ -469,7 +484,7 @@ czfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset,
 	struct fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
 
 	buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-	buf.buf[0].fd = fi->fh;
+	buf.buf[0].fd = czfs_filep(fi)->fd;
 	buf.buf[0].pos = offset;
 
 	fuse_reply_data(req, &buf, FUSE_BUF_SPLICE_MOVE);
@@ -483,7 +498,7 @@ czfs_write_buf(fuse_req_t req, fuse_ino_t ino, struct fuse_bufvec *in_buf,
 	struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT(fuse_buf_size(in_buf));
 
 	out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-	out_buf.buf[0].fd = fi->fh;
+	out_buf.buf[0].fd = czfs_filep(fi)->fd;
 	out_buf.buf[0].pos = off;
 
 	res = fuse_buf_copy(&out_buf, in_buf, 0);
