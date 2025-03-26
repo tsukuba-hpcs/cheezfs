@@ -15,6 +15,7 @@ LT_INIT
 
 # Checks for libraries.
 PKG_CHECK_MODULES([FUSE], [fuse3])
+PKG_CHECK_MODULES([JANSSON], [jansson])
 
 AC_CONFIG_FILES([Makefile])
 AC_OUTPUT
