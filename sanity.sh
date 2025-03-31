@@ -51,3 +51,42 @@ test_directory_create_content_and_list() {
   ls -l "$dirname" | grep "file2" || error "did not find file2"
   echo "OK"
 }
+
+test_safetensors_create() {
+  tmpfile=$(mktemp)
+  chmod 777 $tmpfile
+  cat << EOF > "$tmpfile"
+import numpy as np
+from safetensors.numpy import save_file
+import os
+import sys
+
+
+rng = np.random.default_rng(42)
+
+tensors = {
+    "tensor1": rng.integers(0, 10000, size=(1024*4, 1024*4), dtype=np.int32),
+    "tensor2": rng.integers(0, 100, size=(1024, 1024), dtype=np.int32),
+    "tensor3": rng.integers(-1000, 1000, size=(1024*8), dtype=np.int64),
+}
+
+metadata = {
+    "description": "This is tensor data for testing SafeTensors.",
+    "created_by": "A" * 1866,
+    "modified_by": "A" * 1866,
+    "version": "1.0"
+}
+
+output_path = sys.argv[1]
+
+save_file(tensors, output_path, metadata=metadata)
+EOF
+  mkdir $ROOT/$tfile
+  /home/skoyama/miniconda3/bin/python3 $tmpfile $ROOT/$tfile/1.safetensors
+  sleep 1
+  /home/skoyama/miniconda3/bin/python3 $tmpfile $ROOT/$tfile/2.safetensors
+  sleep 1
+  ls -l $ROOT/$tfile
+  sleep 5
+  rm $tmpfile
+}

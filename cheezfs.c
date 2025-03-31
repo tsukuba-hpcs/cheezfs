@@ -28,11 +28,29 @@ enum {
 	CHEEZ_IGNORE,
 };
 
+struct czfs_tensor {
+	char *key;
+	int fd;
+	size_t data_offsets[2];
+	RB_ENTRY(czfs_tensor) link;
+};
+
+static int
+tensor_compare(struct czfs_tensor *a, struct czfs_tensor *b)
+{
+	return strcmp(a->key, b->key);
+}
+
+RB_HEAD(czfs_ttree, czfs_tensor);
+RB_GENERATE(czfs_ttree, czfs_tensor, link, tensor_compare);
+
 struct czfs_inode {
 	int fd;
 	ino_t ino;
 	dev_t dev;
 	uint64_t refcount;
+	off64_t off;
+	struct czfs_ttree tensors;
 	RB_ENTRY(czfs_inode) link;
 };
 
@@ -53,6 +71,7 @@ struct czfs_data {
 	pthread_mutex_t mutex;
 	struct czfs_itree head;
 	struct czfs_inode root;
+	struct czfs_itree candidate;
 };
 
 static const struct fuse_opt czfs_opts[] = {
@@ -62,23 +81,6 @@ static const struct fuse_opt czfs_opts[] = {
 
 RB_GENERATE(czfs_itree, czfs_inode, link, inode_compare);
 
-struct czfs_tensor {
-	char *key;
-	int fd;
-	size_t data_offsets[2];
-	RB_ENTRY(czfs_tensor) link;
-};
-
-static int
-tensor_compare(struct czfs_tensor *a, struct czfs_tensor *b)
-{
-	fprintf(stderr, "compare a=%s b=%s\n", a->key, b->key);
-	return strcmp(a->key, b->key);
-}
-
-RB_HEAD(czfs_ttree, czfs_tensor);
-RB_GENERATE(czfs_ttree, czfs_tensor, link, tensor_compare);
-
 struct czfs_filep {
 	int fd;
 	int state;
@@ -87,23 +89,23 @@ struct czfs_filep {
 };
 
 static struct czfs_filep *
-czfs_filep(struct fuse_file_info *fi)
+czfs_get_filep(struct fuse_file_info *fi)
 {
 	return (struct czfs_filep *)(uintptr_t)fi->fh;
 }
 
 static struct czfs_data *
-czfs_data(fuse_req_t req)
+czfs_get_data(fuse_req_t req)
 {
 	return (struct czfs_data *)fuse_req_userdata(req);
 }
 
 static struct czfs_inode *
-czfs_inode(fuse_req_t req, fuse_ino_t ino)
+czfs_get_inode(fuse_req_t req, fuse_ino_t ino)
 {
 	if (ino != FUSE_ROOT_ID)
 		return (struct czfs_inode *)(uintptr_t)ino;
-	return &czfs_data(req)->root;
+	return &czfs_get_data(req)->root;
 }
 
 static void
@@ -112,7 +114,8 @@ czfs_init(void *userdata, struct fuse_conn_info *conn)
 	struct czfs_data *data = (struct czfs_data *)userdata;
 	pthread_mutex_init(&data->mutex, NULL);
 	RB_INIT(&data->head);
-	data->root.fd = open(data->source, O_PATH | O_NOFOLLOW);
+	RB_INIT(&data->candidate);
+	data->root.fd = open(data->source, O_DIRECTORY | O_NOFOLLOW);
 	if (data->root.fd < 0) {
 		perror("open");
 		exit(1);
@@ -127,13 +130,14 @@ do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
 	int newfd;
 	int res;
 	int saverr;
-	struct czfs_data *data = czfs_data(req);
+	struct czfs_data *data = czfs_get_data(req);
 	struct czfs_inode *inode = malloc(sizeof(struct czfs_inode));
 	struct czfs_inode *ret;
 	e->attr_timeout = 0;
 	e->entry_timeout = 0;
 
-	newfd = openat(czfs_inode(req, parent)->fd, name, O_PATH | O_NOFOLLOW);
+	newfd =
+	    openat(czfs_get_inode(req, parent)->fd, name, O_PATH | O_NOFOLLOW);
 	if (newfd == -1)
 		goto out_err;
 
@@ -141,10 +145,22 @@ do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
 	if (res == -1)
 		goto out_err;
 
+	close(newfd);
+	if (e->attr.st_mode & S_IFDIR) {
+		newfd = openat(czfs_get_inode(req, parent)->fd, name,
+			       O_DIRECTORY | O_NOFOLLOW);
+	} else {
+		newfd = openat(czfs_get_inode(req, parent)->fd, name,
+			       O_RDWR | O_NOFOLLOW);
+	}
+	if (newfd == -1)
+		goto out_err;
+
 	inode->fd = newfd;
 	inode->ino = e->attr.st_ino;
 	inode->dev = e->attr.st_dev;
 	inode->refcount = 1;
+	RB_INIT(&inode->tensors);
 	pthread_mutex_lock(&data->mutex);
 	ret = RB_INSERT(czfs_itree, &data->head, inode);
 	if (ret) {
@@ -153,6 +169,8 @@ do_lookup(fuse_req_t req, fuse_ino_t parent, const char *name,
 		inode = ret;
 		inode->refcount++;
 	}
+	fprintf(stderr, "lookup insert ino=%zu refcount=%zu\n", inode->ino,
+		inode->refcount);
 	pthread_mutex_unlock(&data->mutex);
 	e->ino = (uintptr_t)inode;
 	return (0);
@@ -171,7 +189,7 @@ czfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
 	struct czfs_inode *dir;
 	int err;
 
-	dir = czfs_inode(req, parent);
+	dir = czfs_get_inode(req, parent);
 
 	err = mkdirat(dir->fd, name, mode);
 	if (err) {
@@ -191,7 +209,7 @@ czfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
 	int res;
 	struct stat buf;
-	int fd = fi ? czfs_filep(fi)->fd : czfs_inode(req, ino)->fd;
+	int fd = fi ? czfs_get_filep(fi)->fd : czfs_get_inode(req, ino)->fd;
 
 	res = fstatat(fd, "", &buf, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
 	if (res == -1) {
@@ -207,13 +225,13 @@ czfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int valid,
 {
 	int saverr;
 	char procname[64];
-	struct czfs_inode *inode = czfs_inode(req, ino);
+	struct czfs_inode *inode = czfs_get_inode(req, ino);
 	int ifd = inode->fd;
 	int res;
 
 	if (valid & FUSE_SET_ATTR_MODE) {
 		if (fi) {
-			res = fchmod(czfs_filep(fi)->fd, attr->st_mode);
+			res = fchmod(czfs_get_filep(fi)->fd, attr->st_mode);
 		} else {
 			sprintf(procname, "/proc/self/fd/%i", ifd);
 			res = chmod(procname, attr->st_mode);
@@ -235,7 +253,7 @@ czfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int valid,
 	}
 	if (valid & FUSE_SET_ATTR_SIZE) {
 		if (fi) {
-			res = ftruncate(czfs_filep(fi)->fd, attr->st_size);
+			res = ftruncate(czfs_get_filep(fi)->fd, attr->st_size);
 		} else {
 			sprintf(procname, "/proc/self/fd/%i", ifd);
 			res = truncate(procname, attr->st_size);
@@ -262,7 +280,7 @@ czfs_setattr(fuse_req_t req, fuse_ino_t ino, struct stat *attr, int valid,
 			tv[1] = attr->st_mtim;
 
 		if (fi)
-			res = futimens(czfs_filep(fi)->fd, tv);
+			res = futimens(czfs_get_filep(fi)->fd, tv);
 		else {
 			sprintf(procname, "/proc/self/fd/%i", ifd);
 			res = utimensat(AT_FDCWD, procname, tv, 0);
@@ -313,7 +331,7 @@ czfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 	if (d == NULL)
 		goto out;
 
-	fd = openat(czfs_inode(req, ino)->fd, ".", O_RDONLY);
+	fd = openat(czfs_get_inode(req, ino)->fd, ".", O_RDONLY);
 	if (fd == -1)
 		goto out_errno;
 
@@ -342,6 +360,429 @@ is_dot_or_dotdot(const char *name)
 {
 	return name[0] == '.' &&
 	       (name[1] == '\0' || (name[1] == '.' && name[2] == '\0'));
+}
+
+static bool
+has_safetensor_suffix(const char *filename)
+{
+	const char *suffix = ".safetensors";
+	size_t len_filename = strlen(filename);
+	size_t len_suffix = strlen(suffix);
+	if (len_filename < len_suffix)
+		return false;
+	return strcmp(filename + len_filename - len_suffix, suffix) == 0;
+}
+
+static void
+czfs_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode,
+	    struct fuse_file_info *fi)
+{
+	struct czfs_filep *fh = malloc(sizeof(*fh));
+	struct fuse_entry_param e;
+	int err;
+
+	fh->fd = openat(czfs_get_inode(req, parent)->fd, name,
+			(fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
+	if (fh->fd == -1) {
+		fuse_reply_err(req, errno);
+		return;
+	}
+	if (has_safetensor_suffix(name)) {
+		fh->state = CHEEZ_INIT;
+	} else {
+		fh->state = CHEEZ_IGNORE;
+	}
+
+	fi->fh = (uint64_t)fh;
+	RB_INIT(&fh->tensors);
+
+	err = do_lookup(req, parent, name, &e);
+	if (err) {
+		fuse_reply_err(req, err);
+		return;
+	}
+
+	fuse_reply_create(req, &e, fi);
+}
+
+static void
+czfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+	char buf[64];
+	struct czfs_filep *fh = malloc(sizeof(*fh));
+
+	sprintf(buf, "/proc/self/fd/%i", czfs_get_inode(req, ino)->fd);
+	fh->fd = open(buf, fi->flags & ~O_NOFOLLOW);
+	if (fh->fd == -1) {
+		fuse_reply_err(req, errno);
+		return;
+	}
+	fh->state = CHEEZ_INIT;
+	fi->fh = (uint64_t)fh;
+	RB_INIT(&fh->tensors);
+
+	if (fi->flags & O_DIRECT)
+		fi->direct_io = 1;
+
+	fuse_reply_open(req, fi);
+}
+
+static void
+czfs_dedup(struct czfs_inode *target, struct czfs_data *data)
+{
+	char procname[64];
+	struct czfs_tensor *tensor;
+	char outbuf[1024];
+	char xattr[128];
+	struct stat tst;
+	fprintf(stderr, "begin dedup\n");
+	RB_FOREACH(tensor, czfs_ttree, &target->tensors)
+	{
+		fprintf(stderr, "foreach key=%s\n", tensor->key);
+
+		assert(tensor->key != NULL);
+		struct czfs_inode *ent;
+		struct file_dedupe_range *fdr =
+		    malloc(sizeof(struct file_dedupe_range) +
+			   sizeof(struct file_dedupe_range_info));
+		assert(fdr != NULL);
+
+		RB_FOREACH(ent, czfs_itree, &data->candidate)
+		{
+			struct czfs_tensor *src;
+			struct stat st;
+			fprintf(stderr, "ent ino=%zu target ino=%zu\n",
+				ent->ino, target->ino);
+
+			if (target->dev != ent->dev)
+				continue;
+			if (target->ino == ent->ino)
+				continue;
+			src = RB_FIND(czfs_ttree, &ent->tensors, tensor);
+			if (src == NULL)
+				continue;
+			if (src->data_offsets[1] - src->data_offsets[0] !=
+			    tensor->data_offsets[1] - tensor->data_offsets[0]) {
+				continue;
+			}
+			fdr->src_offset = src->data_offsets[0] + ent->off;
+			fdr->src_length =
+			    src->data_offsets[1] - src->data_offsets[0];
+			assert(fdr->src_offset % 4096 == 0);
+			assert(fdr->src_length % 4096 == 0);
+			fdr->dest_count = 1;
+			fdr->info[0].bytes_deduped = 0;
+			fdr->info[0].dest_fd = target->fd;
+			fdr->info[0].dest_offset =
+			    tensor->data_offsets[0] + target->off;
+			assert(fdr->info[0].dest_offset % 4096 == 0);
+			fprintf(stderr,
+				"try dedup off=%llu %llu len=%llu src_fd=%d "
+				"target_fd=%d\n",
+				fdr->src_offset, fdr->info[0].dest_offset,
+				fdr->src_length, ent->fd, target->fd);
+			if (ioctl(ent->fd, FIDEDUPERANGE, fdr) == -1) {
+				perror("ioctl");
+				continue;
+			}
+			if (fdr->info[0].status != FILE_DEDUPE_RANGE_SAME) {
+				fprintf(stderr, "not SAME! status=%d\n",
+					fdr->info[0].status);
+				continue;
+			}
+			fprintf(stderr, "dedup %llu bytes\n",
+				fdr->info[0].bytes_deduped);
+			snprintf(outbuf, sizeof(outbuf),
+				 "{\"deduped\": %llu, \"ino\": %zu}",
+				 fdr->info[0].bytes_deduped, ent->ino);
+			snprintf(xattr, sizeof(xattr), "user.cheezfs.%s",
+				 tensor->key);
+			fsetxattr(target->fd, xattr, outbuf, strlen(outbuf) + 1,
+				  0);
+			break;
+		}
+	}
+}
+
+static void
+czfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+	int state = czfs_get_filep(fi)->state;
+	struct czfs_data *data = czfs_get_data(req);
+	struct czfs_inode *inode = czfs_get_inode(req, ino);
+	fprintf(stderr, "release state=%d\n", state);
+	if (state == CHEEZ_BULK) {
+		inode->off = czfs_get_filep(fi)->n + 8;
+		inode->tensors = czfs_get_filep(fi)->tensors;
+	}
+	close(czfs_get_filep(fi)->fd);
+	free((void *)fi->fh);
+	fuse_reply_err(req, 0);
+}
+
+static void
+czfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset,
+	  struct fuse_file_info *fi)
+{
+	struct fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
+
+	buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
+	buf.buf[0].fd = czfs_get_filep(fi)->fd;
+	buf.buf[0].pos = offset;
+
+	fuse_reply_data(req, &buf, FUSE_BUF_SPLICE_MOVE);
+}
+
+static int
+czfs_parse_json(struct fuse_file_info *fi, char *buf)
+{
+	json_error_t error;
+	char *json = malloc(czfs_get_filep(fi)->n + 1);
+	json[czfs_get_filep(fi)->n] = '\0';
+	memcpy(json, buf, czfs_get_filep(fi)->n);
+	fprintf(stderr, "%s\n", json);
+	json_t *root = json_loads(json, 0, &error);
+	void *iter;
+	if (!root) {
+		fprintf(stderr, "error: on line %d: %s\n", error.line,
+			error.text);
+		return 1;
+	}
+	if (!json_is_object(root)) {
+		fprintf(stderr, "error: root is not an object\n");
+		return 1;
+	}
+	iter = json_object_iter(root);
+	while (iter) {
+		const char *key = json_object_iter_key(iter);
+		char *dupkey = strdup(key);
+		json_t *value = json_object_iter_value(iter);
+		if (strcmp(key, "__metadata__") != 0) {
+			struct czfs_tensor *tensor = malloc(sizeof(*tensor));
+			tensor->key = dupkey;
+			tensor->fd = czfs_get_filep(fi)->fd;
+			json_t *data_offsets =
+			    json_object_get(value, "data_offsets");
+			if (!json_is_array(data_offsets)) {
+				fprintf(
+				    stderr,
+				    "error: data_offsets is not an array\n");
+				free(tensor);
+				free(dupkey);
+				return 1;
+			}
+			size_t i;
+			for (i = 0; i < json_array_size(data_offsets); i++) {
+				json_t *o = json_array_get(data_offsets, i);
+				if (json_is_integer(o)) {
+					size_t v =
+					    (size_t)json_integer_value(o);
+					tensor->data_offsets[i] = v;
+				} else {
+					fprintf(stderr,
+						"Non-integer value in array at "
+						"index %zu\n",
+						i);
+					free(tensor);
+					free(dupkey);
+					return 1;
+				}
+			}
+			fprintf(stderr, "dump key=%s offset=[%zu, %zu]\n",
+				tensor->key, tensor->data_offsets[0],
+				tensor->data_offsets[1]);
+			RB_INSERT(czfs_ttree, &czfs_get_filep(fi)->tensors,
+				  tensor);
+		} else
+			free(dupkey);
+		iter = json_object_iter_next(root, iter);
+	}
+	return 0;
+}
+
+static void
+czfs_write_buf(fuse_req_t req, fuse_ino_t ino, struct fuse_bufvec *in_buf,
+	       off_t off, struct fuse_file_info *fi)
+{
+	ssize_t res;
+	size_t len = fuse_buf_size(in_buf);
+	fprintf(stderr, "state=%d len=%zu\n", czfs_get_filep(fi)->state, len);
+	switch (czfs_get_filep(fi)->state) {
+	case CHEEZ_INIT: {
+		char *buf = malloc(len);
+		struct fuse_bufvec tmp = FUSE_BUFVEC_INIT(len);
+		tmp.buf[0].flags = 0;
+		tmp.buf[0].mem = buf;
+		tmp.buf[0].size = len;
+		tmp.buf[0].pos = 0;
+		res = fuse_buf_copy(&tmp, in_buf, 0);
+		if (res != len) {
+			if (res < 0) {
+				fuse_reply_err(req, -res);
+				free(buf);
+				return;
+			} else {
+				len = res;
+				fprintf(stderr, "ignore res=%zu\n",
+					(size_t)res);
+				czfs_get_filep(fi)->state = CHEEZ_IGNORE;
+				goto flush_init;
+			}
+		}
+		if (len == 8) {
+			uint64_t n = *(uint64_t *)buf;
+			czfs_get_filep(fi)->n = le64toh(n);
+			czfs_get_filep(fi)->state = CHEEZ_PREPARE;
+			goto flush_init;
+		} else if (len > 8) {
+			czfs_get_filep(fi)->n = le64toh(*(uint64_t *)(buf));
+			if (len == czfs_get_filep(fi)->n + 8) {
+				char *metadata = buf + 8;
+				if (czfs_parse_json(fi, metadata)) {
+					czfs_get_filep(fi)->state =
+					    CHEEZ_IGNORE;
+					goto flush_init;
+				}
+				czfs_get_filep(fi)->state = CHEEZ_BULK;
+			} else {
+				czfs_get_filep(fi)->state = CHEEZ_IGNORE;
+			}
+			goto flush_init;
+		} else {
+			czfs_get_filep(fi)->state = CHEEZ_IGNORE;
+			goto flush_init;
+		}
+	flush_init:
+		res = pwrite(czfs_get_filep(fi)->fd, buf, len, off);
+		if (res < 0) {
+			fuse_reply_err(req, -res);
+		} else {
+			fuse_reply_write(req, res);
+		}
+		free(buf);
+		return;
+	}
+	case CHEEZ_PREPARE: {
+		char *buf = malloc(len);
+		struct fuse_bufvec tmp = FUSE_BUFVEC_INIT(len);
+		tmp.buf[0].flags = 0;
+		tmp.buf[0].mem = buf;
+		tmp.buf[0].size = 8;
+		tmp.buf[0].pos = 0;
+		res = fuse_buf_copy(&tmp, in_buf, 0);
+		if (res != len) {
+			if (res < 0) {
+				fuse_reply_err(req, -res);
+				free(buf);
+				return;
+			} else {
+				len = res;
+				czfs_get_filep(fi)->state = CHEEZ_IGNORE;
+				goto flush_prepare;
+			}
+		}
+
+		if (len != czfs_get_filep(fi)->n) {
+			czfs_get_filep(fi)->state = CHEEZ_IGNORE;
+			goto flush_prepare;
+		}
+		if (czfs_parse_json(fi, buf)) {
+			czfs_get_filep(fi)->state = CHEEZ_IGNORE;
+			goto flush_prepare;
+		}
+		czfs_get_filep(fi)->state = CHEEZ_BULK;
+	flush_prepare:
+		res = pwrite(czfs_get_filep(fi)->fd, buf, len, off);
+		if (res < 0) {
+			fuse_reply_err(req, -res);
+		} else {
+			fuse_reply_write(req, res);
+		}
+		free(buf);
+		return;
+	}
+	default:
+		break;
+	}
+	struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT(fuse_buf_size(in_buf));
+
+	out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
+	out_buf.buf[0].fd = czfs_get_filep(fi)->fd;
+	out_buf.buf[0].pos = off;
+
+	res = fuse_buf_copy(&out_buf, in_buf, 0);
+	if (res < 0) {
+		fprintf(stderr, "fuse_buf_copy res=%s\n", strerror(-res));
+		fuse_reply_err(req, -res);
+		return;
+	}
+	fprintf(stderr, "fuse_reply_write %zu\n", (size_t)res);
+	fuse_reply_write(req, (size_t)res);
+}
+
+static void
+czfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
+	    fuse_ino_t newparent, const char *newname, unsigned int flags)
+{
+	int res;
+
+	if (flags) {
+		fuse_reply_err(req, EINVAL);
+		return;
+	}
+
+	res = renameat(czfs_get_inode(req, parent)->fd, name,
+		       czfs_get_inode(req, newparent)->fd, newname);
+
+	if (res == -1) {
+		fuse_reply_err(req, errno);
+		return;
+	}
+
+	fuse_reply_err(req, 0);
+}
+
+static void
+czfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
+{
+	int res;
+
+	res = unlinkat(czfs_get_inode(req, parent)->fd, name, 0);
+
+	fuse_reply_err(req, res == -1 ? errno : 0);
+}
+
+static void
+czfs_forget_one(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
+{
+	struct czfs_data *data = czfs_get_data(req);
+	struct czfs_inode *inode = czfs_get_inode(req, ino);
+
+	pthread_mutex_lock(&data->mutex);
+	assert(inode->refcount >= nlookup);
+	inode->refcount -= nlookup;
+	fprintf(stderr, "inode->refcount=%lu\n", inode->refcount);
+	if (inode->refcount == 0) {
+		if (RB_EMPTY(&inode->tensors)) {
+			close(inode->fd);
+		} else {
+			fprintf(stderr, "forget insert ino=%zu\n", inode->ino);
+			RB_INSERT(czfs_itree, &data->candidate, inode);
+			czfs_dedup(inode, data);
+		}
+		RB_REMOVE(czfs_itree, &data->head, inode);
+		if (RB_EMPTY(&inode->tensors)) {
+			free(inode);
+		}
+	}
+	pthread_mutex_unlock(&data->mutex);
+}
+
+static void
+czfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
+{
+	czfs_forget_one(req, ino, nlookup);
+	fuse_reply_none(req);
 }
 
 static void
@@ -385,6 +826,7 @@ do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset,
 		}
 		nextoff = d->entry->d_off;
 		name = d->entry->d_name;
+		fuse_ino_t entry_ino = 0;
 		if (plus) {
 			struct fuse_entry_param e;
 			if (is_dot_or_dotdot(name)) {
@@ -396,6 +838,7 @@ do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset,
 				err = do_lookup(req, ino, name, &e);
 				if (err)
 					goto error;
+				entry_ino = e.ino;
 			}
 
 			entsize = fuse_add_direntry_plus(req, p, rem, name, &e,
@@ -408,8 +851,12 @@ do_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset,
 			entsize =
 			    fuse_add_direntry(req, p, rem, name, &st, nextoff);
 		}
-		if (entsize > rem)
+		if (entsize > rem) {
+			if (entry_ino != 0) {
+				czfs_forget_one(req, entry_ino, 1);
+			}
 			break;
+		}
 
 		p += entsize;
 		rem -= entsize;
@@ -438,329 +885,6 @@ czfs_readdirplus(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 		 struct fuse_file_info *fi)
 {
 	do_readdir(req, ino, size, off, fi, 1);
-}
-
-static bool
-has_safetensor_suffix(const char *filename)
-{
-	const char *suffix = ".safetensors";
-	size_t len_filename = strlen(filename);
-	size_t len_suffix = strlen(suffix);
-	if (len_filename < len_suffix)
-		return false;
-	return strcmp(filename + len_filename - len_suffix, suffix) == 0;
-}
-
-static void
-czfs_create(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode,
-	    struct fuse_file_info *fi)
-{
-	struct czfs_filep *fh = malloc(sizeof(*fh));
-	struct fuse_entry_param e;
-	int err;
-
-	fh->fd = openat(czfs_inode(req, parent)->fd, name,
-			(fi->flags | O_CREAT) & ~O_NOFOLLOW, mode);
-	if (fh->fd == -1) {
-		fuse_reply_err(req, errno);
-		return;
-	}
-	if (has_safetensor_suffix(name)) {
-		fh->state = CHEEZ_INIT;
-	} else {
-		fh->state = CHEEZ_IGNORE;
-	}
-
-	fi->fh = (uint64_t)fh;
-	RB_INIT(&fh->tensors);
-
-	err = do_lookup(req, parent, name, &e);
-	if (err) {
-		fuse_reply_err(req, err);
-		return;
-	}
-
-	fuse_reply_create(req, &e, fi);
-}
-
-static void
-czfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
-{
-	char buf[64];
-	struct czfs_filep *fh = malloc(sizeof(*fh));
-
-	sprintf(buf, "/proc/self/fd/%i", czfs_inode(req, ino)->fd);
-	fh->fd = open(buf, fi->flags & ~O_NOFOLLOW);
-	if (fh->fd == -1) {
-		fuse_reply_err(req, errno);
-		return;
-	}
-	fh->state = CHEEZ_INIT;
-	fi->fh = (uint64_t)fh;
-	RB_INIT(&fh->tensors);
-
-	if (fi->flags & O_DIRECT)
-		fi->direct_io = 1;
-
-	fuse_reply_open(req, fi);
-}
-
-static void
-czfs_release(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
-{
-	close(czfs_filep(fi)->fd);
-	free((void *)fi->fh);
-	fuse_reply_err(req, 0);
-	return;
-}
-
-static void
-czfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t offset,
-	  struct fuse_file_info *fi)
-{
-	struct fuse_bufvec buf = FUSE_BUFVEC_INIT(size);
-
-	buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-	buf.buf[0].fd = czfs_filep(fi)->fd;
-	buf.buf[0].pos = offset;
-
-	fuse_reply_data(req, &buf, FUSE_BUF_SPLICE_MOVE);
-}
-
-static int
-czfs_parse_json(struct fuse_file_info *fi, char *buf)
-{
-	json_error_t error;
-	char *json = malloc(czfs_filep(fi)->n + 1);
-	json[czfs_filep(fi)->n] = '\0';
-	memcpy(json, buf, czfs_filep(fi)->n);
-	fprintf(stderr, "%s\n", json);
-	json_t *root = json_loads(json, 0, &error);
-	void *iter;
-	if (!root) {
-		fprintf(stderr, "error: on line %d: %s\n", error.line,
-			error.text);
-		return 1;
-	}
-	if (!json_is_object(root)) {
-		fprintf(stderr, "error: root is not an object\n");
-		return 1;
-	}
-	iter = json_object_iter(root);
-	while (iter) {
-		const char *key = json_object_iter_key(iter);
-		fprintf(stderr, "key=%s\n", key);
-		char *dupkey = strdup(key);
-		json_t *value = json_object_iter_value(iter);
-		if (strcmp(key, "__metadata__") != 0) {
-			struct czfs_tensor *tensor = malloc(sizeof(*tensor));
-			tensor->key = dupkey;
-			tensor->fd = czfs_filep(fi)->fd;
-			json_t *data_offsets =
-			    json_object_get(value, "data_offsets");
-			if (!json_is_array(data_offsets)) {
-				fprintf(
-				    stderr,
-				    "error: data_offsets is not an array\n");
-				free(tensor);
-				free(dupkey);
-				return 1;
-			}
-			size_t i;
-			for (i = 0; i < json_array_size(data_offsets); i++) {
-				json_t *o = json_array_get(data_offsets, i);
-				if (json_is_integer(o)) {
-					size_t v =
-					    (size_t)json_integer_value(o);
-					tensor->data_offsets[i] = v;
-				} else {
-					fprintf(stderr,
-						"Non-integer value in array at "
-						"index %zu\n",
-						i);
-					free(tensor);
-					free(dupkey);
-					return 1;
-				}
-			}
-			fprintf(stderr, "dump key=%s offset=[%zu, %zu]\n",
-				tensor->key, tensor->data_offsets[0],
-				tensor->data_offsets[1]);
-			RB_INSERT(czfs_ttree, &czfs_filep(fi)->tensors, tensor);
-		} else
-			free(dupkey);
-		iter = json_object_iter_next(root, iter);
-	}
-	return 0;
-}
-
-static void
-czfs_write_buf(fuse_req_t req, fuse_ino_t ino, struct fuse_bufvec *in_buf,
-	       off_t off, struct fuse_file_info *fi)
-{
-	ssize_t res;
-	size_t len = fuse_buf_size(in_buf);
-	fprintf(stderr, "state=%d len=%zu\n", czfs_filep(fi)->state, len);
-	switch (czfs_filep(fi)->state) {
-	case CHEEZ_INIT: {
-		char *buf = malloc(len);
-		struct fuse_bufvec tmp = FUSE_BUFVEC_INIT(len);
-		tmp.buf[0].flags = 0;
-		tmp.buf[0].mem = buf;
-		tmp.buf[0].size = len;
-		tmp.buf[0].pos = 0;
-		res = fuse_buf_copy(&tmp, in_buf, 0);
-		if (res != len) {
-			if (res < 0) {
-				fuse_reply_err(req, -res);
-				free(buf);
-				return;
-			} else {
-				len = res;
-				fprintf(stderr, "ignore res=%zu\n",
-					(size_t)res);
-				czfs_filep(fi)->state = CHEEZ_IGNORE;
-				goto flush_init;
-			}
-		}
-		if (len == 8) {
-			uint64_t n = *(uint64_t *)buf;
-			czfs_filep(fi)->n = le64toh(n);
-			czfs_filep(fi)->state = CHEEZ_PREPARE;
-			goto flush_init;
-		} else if (len > 8) {
-			czfs_filep(fi)->n = le64toh(*(uint64_t *)(buf));
-			if (len == czfs_filep(fi)->n + 8) {
-				char *metadata = buf + 8;
-				if (czfs_parse_json(fi, metadata)) {
-					czfs_filep(fi)->state = CHEEZ_IGNORE;
-					goto flush_init;
-				}
-				czfs_filep(fi)->state = CHEEZ_BULK;
-			} else {
-				czfs_filep(fi)->state = CHEEZ_IGNORE;
-			}
-			goto flush_init;
-		} else {
-			czfs_filep(fi)->state = CHEEZ_IGNORE;
-			goto flush_init;
-		}
-	flush_init:
-		res = pwrite(czfs_filep(fi)->fd, buf, len, off);
-		if (res < 0) {
-			fuse_reply_err(req, -res);
-		} else {
-			fuse_reply_write(req, res);
-		}
-		free(buf);
-		return;
-	}
-	case CHEEZ_PREPARE: {
-		char *buf = malloc(len);
-		struct fuse_bufvec tmp = FUSE_BUFVEC_INIT(len);
-		tmp.buf[0].flags = 0;
-		tmp.buf[0].mem = buf;
-		tmp.buf[0].size = 8;
-		tmp.buf[0].pos = 0;
-		res = fuse_buf_copy(&tmp, in_buf, 0);
-		if (res != len) {
-			if (res < 0) {
-				fuse_reply_err(req, -res);
-				free(buf);
-				return;
-			} else {
-				len = res;
-				czfs_filep(fi)->state = CHEEZ_IGNORE;
-				goto flush_prepare;
-			}
-		}
-
-		if (len != czfs_filep(fi)->n) {
-			czfs_filep(fi)->state = CHEEZ_IGNORE;
-			goto flush_prepare;
-		}
-		if (czfs_parse_json(fi, buf)) {
-			czfs_filep(fi)->state = CHEEZ_IGNORE;
-			goto flush_prepare;
-		}
-		czfs_filep(fi)->state = CHEEZ_BULK;
-	flush_prepare:
-		res = pwrite(czfs_filep(fi)->fd, buf, len, off);
-		if (res < 0) {
-			fuse_reply_err(req, -res);
-		} else {
-			fuse_reply_write(req, res);
-		}
-		free(buf);
-		return;
-	}
-	default:
-		break;
-	}
-	struct fuse_bufvec out_buf = FUSE_BUFVEC_INIT(fuse_buf_size(in_buf));
-
-	out_buf.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-	out_buf.buf[0].fd = czfs_filep(fi)->fd;
-	out_buf.buf[0].pos = off;
-
-	res = fuse_buf_copy(&out_buf, in_buf, 0);
-	if (res < 0) {
-		fprintf(stderr, "fuse_buf_copy res=%s\n", strerror(-res));
-		fuse_reply_err(req, -res);
-		return;
-	}
-	fprintf(stderr, "fuse_reply_write %zu\n", (size_t)res);
-	fuse_reply_write(req, (size_t)res);
-}
-
-static void
-czfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name,
-	    fuse_ino_t newparent, const char *newname, unsigned int flags)
-{
-	int res;
-
-	if (flags) {
-		fuse_reply_err(req, EINVAL);
-		return;
-	}
-
-	res = renameat(czfs_inode(req, parent)->fd, name,
-		       czfs_inode(req, newparent)->fd, newname);
-
-	if (res == -1) {
-		fuse_reply_err(req, errno);
-		return;
-	}
-
-	fuse_reply_err(req, 0);
-}
-
-static void
-czfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
-{
-	int res;
-
-	res = unlinkat(czfs_inode(req, parent)->fd, name, 0);
-
-	fuse_reply_err(req, res == -1 ? errno : 0);
-}
-
-static void
-czfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
-{
-	struct czfs_data *data = czfs_data(req);
-	struct czfs_inode *inode = czfs_inode(req, ino);
-
-	pthread_mutex_lock(&data->mutex);
-	assert(inode->refcount >= nlookup);
-	inode->refcount -= nlookup;
-	if (inode->refcount == 0) {
-		close(inode->fd);
-		RB_REMOVE(czfs_itree, &data->head, inode);
-		free(inode);
-	}
-	pthread_mutex_unlock(&data->mutex);
-	fuse_reply_none(req);
 }
 
 static struct fuse_lowlevel_ops czfs_oper = {
